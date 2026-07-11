@@ -14,11 +14,10 @@ from google.cloud import storage
 from google.cloud import bigquery
 
 GOV_UK_PAGE = "https://www.gov.uk/government/publications/register-of-licensed-sponsors-workers"
-BUCKET_NAME = os.environ.get("SPONSORS_BUCKET", "REPLACE_WITH_YOUR_BUCKET_NAME")
+BUCKET_NAME = os.environ.get("SPONSORS_BUCKET", "mtechprojects69")
 BQ_DATASET = os.environ.get("BQ_DATASET", "uk_sponsor_pipeline")
 BQ_TABLE = os.environ.get("BQ_TABLE", "raw_sponsors")
-BQ_PROJECT = os.environ.get("GCP_PROJECT")
-
+BQ_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT")
 CSV_LINK_PATTERN = re.compile(
     r'https://assets\.publishing\.service\.gov\.uk/media/[^\s"\']+\.csv'
 )
