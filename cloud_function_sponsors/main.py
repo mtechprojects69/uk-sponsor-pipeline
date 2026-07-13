@@ -50,17 +50,43 @@ def upload_to_gcs(content: bytes, filename: str) -> str:
 def load_to_bigquery(gcs_uri: str):
     client = bigquery.Client()
     table_ref = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+
+    schema = [
+        bigquery.SchemaField("organisation_name", "STRING"),
+        bigquery.SchemaField("town_city", "STRING"),
+        bigquery.SchemaField("county", "STRING"),
+        bigquery.SchemaField("type_rating", "STRING"),
+        bigquery.SchemaField("route", "STRING"),
+    ]
+
     job_config = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.CSV,
         skip_leading_rows=1,
-        autodetect=True,
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        schema=schema,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
     )
+
     load_job = client.load_table_from_uri(gcs_uri, table_ref, job_config=job_config)
     load_job.result()
+
+    # Ensure the loaded_at column exists before we try to set it.
+    # IF NOT EXISTS makes this safe to run every single time.
+    ensure_column_query = f"""
+        ALTER TABLE `{table_ref}`
+        ADD COLUMN IF NOT EXISTS loaded_at DATE
+    """
+    client.query(ensure_column_query).result()
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    update_query = f"""
+        UPDATE `{table_ref}`
+        SET loaded_at = DATE('{today}')
+        WHERE loaded_at IS NULL
+    """
+    client.query(update_query).result()
+
     table = client.get_table(table_ref)
     return table.num_rows
-
 
 @functions_framework.http
 def ingest_sponsors(request):
