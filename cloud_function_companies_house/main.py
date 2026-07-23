@@ -13,14 +13,15 @@ Approach:
    b. Call the Companies House PROFILE API (using that number) to get
       full details, including sic_codes — search alone doesn't return
       industry classification, only profile does.
-   c. Check the returned sic_codes against a known list of IT/tech SIC
-      codes. Only IT/tech companies get written to raw_companies_house.
+   c. Check the returned sic_codes against the tech SIC codes loaded
+      from ref_sic_codes (division IN 58/62/63). Only IT/tech companies
+      get written to raw_companies_house.
 4. Every sponsor is logged in companies_house_attempts regardless of
    industry (matched-but-not-tech counts as "attempted"), so re-runs
    never re-query the same non-tech company repeatedly.
 
-Trigger: HTTP (can be scheduled, e.g. weekly, since company registration
-details don't change daily the way the sponsor register does).
+Trigger: HTTP (can be scheduled, e.g. every 10 minutes, since company
+registration details don't change daily the way the sponsor register does).
 
 Rate limiting: Companies House allows 600 requests per 5 minutes.
 Since this version makes TWO calls per sponsor (search + profile),
@@ -30,18 +31,12 @@ pacing and batch size are set with this in mind.
 
 import os
 import time
+import logging
 from datetime import datetime, timezone
 
 import requests
 import functions_framework
 from google.cloud import bigquery
-import logging
-
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
-REQUEST_DELAY_SECONDS = float(
-    os.environ.get("REQUEST_DELAY_SECONDS", "0.6")
-)
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
 
 logging.basicConfig(level=logging.INFO)
 
@@ -52,44 +47,32 @@ CH_PROFILE_URL = "https://api.company-information.service.gov.uk/company/{compan
 BQ_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT")
 BQ_DATASET = os.environ.get("BQ_DATASET", "uk_sponsor_pipeline")
 SILVER_DATASET = os.environ.get("SILVER_DATASET", "uk_sponsor_pipeline_silver")
+REFERENCE_DATASET = os.environ.get("REFERENCE_DATASET", "uk_sponsor_pipeline_reference")
 CH_TABLE = os.environ.get("CH_TABLE", "raw_companies_house")
 ATTEMPTS_TABLE = os.environ.get("ATTEMPTS_TABLE", "companies_house_attempts")
 
-# How many sponsors to process per run — keeps each invocation fast and
-# within Cloud Functions' request timeout. Re-running the function
-# picks up where it left off, since already-attempted sponsors are skipped.
 BATCH_SIZE = int(os.environ.get("CH_BATCH_SIZE", "150"))
-
-# Seconds to wait between API calls, to stay comfortably under
-# Companies House's 600-requests-per-5-minutes limit. We make 2 calls
-# per sponsor (search + profile), so this delay applies between each
-# individual HTTP call, not per sponsor.
-REQUEST_DELAY_SECONDS = 0.6
-
-# UK SIC 2007 codes covering IT / software / tech services.
-# Reference: gov.uk SIC code list, "Information and communication" section.
-TECH_SIC_CODES = {
-    "58201",  # Publishing of computer games
-    "58202",  # Other software publishing
-    "62011",  # Ready-made interactive leisure and entertainment software development
-    "62012",  # Business and domestic software development
-    "62020",  # Information technology consultancy activities
-    "62030",  # Computer facilities management activities
-    "62090",  # Other information technology and computer service activities
-    "63110",  # Data processing, hosting and related activities
-    "63120",  # Web portals
-    "63990",  # Other information service activities n.e.c.
-    "26200",  # Manufacture of computers and peripheral equipment
-    "46510",  # Wholesale of computers, computer peripheral equipment and software
-    "47410",  # Retail sale of computers, peripheral units and software in specialised stores
-    "95110",  # Repair of computers and peripheral equipment
-}
+REQUEST_DELAY_SECONDS = float(os.environ.get("REQUEST_DELAY_SECONDS", "0.6"))
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
 
 
-def is_tech_company(sic_codes: list) -> bool:
-    if not sic_codes:
-        return False
-    return any(code in TECH_SIC_CODES for code in sic_codes)
+def is_tech_company(sic_codes, valid_tech_sics):
+    return any(sic in valid_tech_sics for sic in sic_codes)
+
+
+def load_valid_tech_sics(client: bigquery.Client):
+    """Load the set of SIC codes considered 'tech' from the reference
+    table, using official UK SIC 2007 divisions:
+    58 = Publishing (incl. software), 62 = IT & programming,
+    63 = Information service activities."""
+    query = f"""
+        SELECT sic_code
+        FROM `{BQ_PROJECT}.{REFERENCE_DATASET}.ref_sic_codes`
+        WHERE division IN ('58', '62', '63')
+    """
+    rows = client.query(query).result()
+    return {str(row.sic_code).strip() for row in rows}
 
 
 def get_unattempted_sponsors(client: bigquery.Client, limit: int):
@@ -110,21 +93,51 @@ def get_unattempted_sponsors(client: bigquery.Client, limit: int):
     return [row.name_for_matching for row in client.query(query).result()]
 
 
-def search_company(name: str):
+def companies_house_get(url, params=None):
+    """Wrapper for Companies House API calls with exponential backoff retry."""
+    backoff = 2
 
-    response = companies_house_get(
-        CH_SEARCH_URL,
-        {
-            "q": name,
-            "items_per_page": 1,
-        },
-    )
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                auth=(CH_API_KEY, ""),  # HTTP Basic auth: API key as username, blank password
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if response.status_code == 200:
+                return response
+
+            if response.status_code in (429, 500, 502, 503, 504):
+                retry_after = response.headers.get("Retry-After")
+                wait = int(retry_after) if retry_after else backoff ** attempt
+                logging.warning(
+                    f"HTTP {response.status_code}. Retry {attempt + 1}/{MAX_RETRIES} waiting {wait}s"
+                )
+                time.sleep(wait)
+                continue
+
+            logging.error(f"Companies House returned HTTP {response.status_code}")
+            return None
+
+        except requests.RequestException as ex:
+            wait = backoff ** attempt
+            logging.warning(f"Network error ({ex}). Retry {attempt + 1}/{MAX_RETRIES}")
+            time.sleep(wait)
+
+    return None
+
+
+def search_company(name: str):
+    """Query the Companies House search API for a company name.
+    Returns the top result dict, or None if nothing found."""
+    response = companies_house_get(CH_SEARCH_URL, {"q": name, "items_per_page": 1})
 
     if response is None:
         return None
 
     items = response.json().get("items", [])
-
     if not items:
         return None
 
@@ -132,10 +145,8 @@ def search_company(name: str):
 
 
 def get_company_profile(company_number: str):
-
-    response = companies_house_get(
-        CH_PROFILE_URL.format(company_number=company_number)
-    )
+    """Fetch full company profile, including sic_codes, by company number."""
+    response = companies_house_get(CH_PROFILE_URL.format(company_number=company_number))
 
     if response is None:
         return None
@@ -161,63 +172,6 @@ def _write_json_rows(client: bigquery.Client, table_ref: str, rows: list, schema
     load_job = client.load_table_from_file(buffer, table_ref, job_config=job_config)
     load_job.result()
 
-def companies_house_get(url, params=None):
-    """
-    Wrapper para chamadas à API do Companies House
-    com retry exponencial.
-    """
-
-    backoff = 2
-
-    for attempt in range(MAX_RETRIES):
-
-        try:
-
-            response = requests.get(
-                url,
-                params=params,
-                auth=(CH_API_KEY, ""),
-                timeout=REQUEST_TIMEOUT,
-            )
-
-            if response.status_code == 200:
-                return response
-
-            if response.status_code in [429, 500, 502, 503, 504]:
-
-                retry_after = response.headers.get("Retry-After")
-
-                wait = (
-                    int(retry_after)
-                    if retry_after
-                    else backoff ** attempt
-                )
-
-                logging.warning(
-                    f"HTTP {response.status_code}. Retry {attempt+1}/{MAX_RETRIES} "
-                    f"waiting {wait}s"
-                )
-
-                time.sleep(wait)
-                continue
-
-            logging.error(
-                f"Companies House returned HTTP {response.status_code}"
-            )
-
-            return None
-
-        except requests.RequestException as ex:
-
-            wait = backoff ** attempt
-
-            logging.warning(
-                f"Network error ({ex}). Retry {attempt+1}/{MAX_RETRIES}"
-            )
-
-            time.sleep(wait)
-
-    return None
 
 def write_matches(client: bigquery.Client, matches: list):
     """Only real Companies House matches that are IT/tech companies land
@@ -254,7 +208,11 @@ def enrich_companies_house(request):
     if not CH_API_KEY:
         return {"status": "error", "message": "COMPANIES_HOUSE_API_KEY env var not set"}, 500
 
-    client = bigquery.Client()
+    client = bigquery.Client()  # created first — everything below depends on this
+
+    logging.info("Loading Tech SIC codes...")
+    valid_tech_sics = load_valid_tech_sics(client)
+    logging.info(f"{len(valid_tech_sics)} Tech SIC codes loaded.")
 
     try:
         sponsor_names = get_unattempted_sponsors(client, BATCH_SIZE)
@@ -276,34 +234,26 @@ def enrich_companies_house(request):
     for name in sponsor_names:
         logging.info(f"Processing sponsor: {name}")
         search_result = search_company(name)
-        if search_result:
-            logging.info(
-                f"Matched: {search_result.get('company_number')}"
-            )
-        else:
-            logging.info("No Companies House match")
-
         time.sleep(REQUEST_DELAY_SECONDS)
 
         if not search_result:
+            logging.info("No Companies House match")
             attempts.append({"name_for_matching": name, "was_matched": False, "attempted_at": now})
             not_found_count += 1
             continue
 
+        logging.info(f"Matched: {search_result.get('company_number')}")
         matched_count += 1
         company_number = search_result.get("company_number")
 
         profile = get_company_profile(company_number) if company_number else None
         time.sleep(REQUEST_DELAY_SECONDS)
-        if profile:
-            logging.info(
-                f"SIC codes: {profile.get('sic_codes', [])}"
-            )
 
         sic_codes = (profile or {}).get("sic_codes", [])
+        logging.info(f"SIC codes: {sic_codes}")
 
-        if is_tech_company(sic_codes):
-            logging.info("Tech company")
+        if is_tech_company(sic_codes, valid_tech_sics):
+            logging.info("Tech company — keeping")
             address = (profile or {}).get("registered_office_address", {})
             address_str = ", ".join(
                 str(v) for v in [
@@ -312,9 +262,7 @@ def enrich_companies_house(request):
                     address.get("postal_code"),
                 ] if v
             )
-        else:
-            logging.info("Non-tech company")
-            
+
             matches.append({
                 "name_for_matching": name,
                 "company_name": search_result.get("title"),
@@ -327,10 +275,12 @@ def enrich_companies_house(request):
                 "matched_at": now,
             })
             tech_count += 1
+        else:
+            logging.info("Non-tech company — skipping")
 
-        # Every sponsor we found on Companies House is logged as "attempted
-        # and matched", regardless of whether it passed the tech filter —
-        # this prevents re-querying non-tech companies on future runs.
+        # Every sponsor found on Companies House is logged as "attempted",
+        # regardless of the tech filter outcome — prevents re-querying
+        # the same non-tech company on future runs.
         attempts.append({"name_for_matching": name, "was_matched": True, "attempted_at": now})
 
     if matches:
